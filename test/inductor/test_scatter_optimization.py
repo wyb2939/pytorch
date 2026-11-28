@@ -569,70 +569,6 @@ class TestPartitionedScatterOpt(TestCase):
         for e, a in zip(expected, actual):
             self.assertEqual(e, a, atol=1e-1, rtol=1e-2)
 
-    def test_index_add_alpha_not_matched(self):
-        """alpha scales the source, which the rewrite does not carry, so an
-        aten.index_add holding one must not be picked up. Asserted on the scan:
-        where the decomposition fires instead, alpha is folded into the source
-        and the index_put left behind is matched legitimately."""
-        N, n, D = 8192, 8, 4
-
-        graph = torch.fx.Graph()
-        out_node = graph.placeholder("out")
-        idx_node = graph.placeholder("idx")
-        vals_node = graph.placeholder("vals")
-        plain = graph.call_function(
-            torch.ops.aten.index_add.default, (out_node, 0, idx_node, vals_node)
-        )
-        scaled = graph.call_function(
-            torch.ops.aten.index_add.default,
-            (out_node, 0, idx_node, vals_node),
-            {"alpha": 2},
-        )
-
-        out_node.meta["val"] = torch.empty(n, D, dtype=torch.bfloat16, device="meta")
-        idx_node.meta["val"] = torch.empty(N, dtype=torch.int64, device="meta")
-        vals_node.meta["val"] = torch.empty(N, D, dtype=torch.bfloat16, device="meta")
-
-        ctx = ScatterPassContext()
-        _scan_candidates(graph, ctx)
-        self.assertIn(plain, ctx.candidates)
-        self.assertNotIn(scaled, ctx.candidates)
-
-    def test_atomic_fallback_checks_accumulation_dtype(self):
-        """Where bf16 atomics fall back (sm<90, XPU) aten.index_add is only ever
-        bf16, so the gate must look at the dtype the rewrite emits: fp32 partials
-        are native atomics, bf16 partials would fall back onto a P-times buffer."""
-        N, n, D = 8192, 8, 4
-
-        graph = torch.fx.Graph()
-        out_node = graph.placeholder("out")
-        idx_node = graph.placeholder("idx")
-        vals_node = graph.placeholder("vals")
-        index_add = graph.call_function(
-            torch.ops.aten.index_add.default, (out_node, 0, idx_node, vals_node)
-        )
-        out_node.meta["val"] = torch.empty(n, D, dtype=torch.bfloat16, device="meta")
-        idx_node.meta["val"] = torch.empty(N, dtype=torch.int64, device="meta")
-        vals_node.meta["val"] = torch.empty(N, D, dtype=torch.bfloat16, device="meta")
-
-        def bf16_atomics_fall_back(dtype):
-            return dtype in (torch.bfloat16, torch.int64, torch.bool)
-
-        with mock.patch(
-            "torch._inductor.utils.needs_fallback_due_to_atomic_add_limitations",
-            bf16_atomics_fall_back,
-        ):
-            for fp32_acc in (True, False):
-                ctx = ScatterPassContext()
-                with config.patch(partitioned_scatter_fp32_accumulation=fp32_acc):
-                    candidate = _evaluate_candidate(index_add, True, ctx)
-                if fp32_acc:
-                    self.assertIsNotNone(candidate)
-                    self.assertEqual(candidate.acc_dtype, torch.float32)
-                else:
-                    self.assertIsNone(candidate)
-                    self.assertEqual(ctx.skip_reasons["atomic_fallback"], 1)
-
     def test_partials_widened_only_when_flag_is_set(self):
         """The flag decides the partial buffers' dtype and nothing else, so
         either way the result must agree with the unpartitioned bf16 scatter."""
@@ -675,22 +611,6 @@ class TestPartitionedScatterOpt(TestCase):
             self.assertTrue(allocations)
             widened = [ln for ln in allocations if "torch.float32" in ln]
             self.assertEqual(bool(widened), fp32_acc, f"{fp32_acc=} {allocations=}")
-
-    def test_accumulation_dtype_follows_config(self):
-        """Only float dtypes narrower than fp32 are promoted, and only when the
-        config flag is set."""
-        narrow = (torch.bfloat16, torch.float16)
-        unchanged = (torch.float32, torch.float64, torch.int32, torch.int64)
-
-        with config.patch(partitioned_scatter_fp32_accumulation=True):
-            for dtype in narrow:
-                self.assertEqual(_accumulation_dtype(dtype), torch.float32, str(dtype))
-            for dtype in unchanged:
-                self.assertEqual(_accumulation_dtype(dtype), dtype, str(dtype))
-
-        with config.patch(partitioned_scatter_fp32_accumulation=False):
-            for dtype in narrow + unchanged:
-                self.assertEqual(_accumulation_dtype(dtype), dtype, str(dtype))
 
     def test_fp32_accumulation_reduces_bf16_error(self):
         """fp32 partials fix the bf16 stagnation without widening the output."""
@@ -1151,103 +1071,6 @@ class TestPartitionedScatterOpt(TestCase):
         )
         self.assertEqual(expected, actual, atol=1e-3, rtol=1e-3)
 
-    def test_compute_num_partitions_tight_budget(self):
-        """Memory constraint picks P=4: P=8 overhead (28 MB) exceeds 20 MB budget."""
-        # P=4: overhead = 1M * 4 * 3 = 12 MB ≤ 20 MB
-        # P=8: overhead = 1M * 4 * 7 = 28 MB > 20 MB
-        result = _compute_num_partitions(20_000_000, 1_000_000, 4, min_p=2, max_p=128)
-        self.assertEqual(result, 4)
-
-    def test_widen_bytes_charged_outside_expanded_buffer(self):
-        """fp32 partials also cost a widened copy of the values and the width the
-        peak's own output copy cannot credit. Neither scales with num_partitions."""
-        node = torch.fx.Graph().placeholder("x")
-
-        def candidate(dtype, acc_dtype):
-            return ScatterCandidate(
-                output_node=node,
-                index_node=node,
-                scatter_dim=0,
-                output_size=1_000_000,
-                index_size=4_000_000,
-                scatter_dim_size=1_000_000,
-                values_numel=4_000_000,
-                contention_ratio=4.0,
-                writes_per_slot=4.0,
-                dtype=dtype,
-                acc_dtype=acc_dtype,
-            )
-
-        same = candidate(torch.float32, torch.float32)
-        wider = candidate(torch.bfloat16, torch.float32)
-
-        self.assertEqual(_widen_bytes(same), 0)
-        # 4M values at fp32, plus the 2 bytes/element a bf16 output cannot cover.
-        self.assertEqual(_widen_bytes(wider), 18_000_000)
-
-    @config.patch(
-        partitioned_scatter_min_index_size=1,
-        partitioned_scatter_min_contention_ratio=0.0,
-    )
-    def test_scatter_widening_uses_full_source_size(self):
-        """scatter permits src to be larger than index, and the rewrite widens
-        all of it, so the charge cannot be derived from the index."""
-        graph = torch.fx.Graph()
-        input_node = graph.placeholder("input")
-        index_node = graph.placeholder("index")
-        values_node = graph.placeholder("values")
-        output_node = graph.call_function(
-            torch.ops.aten.scatter_add.default,
-            (input_node, 0, index_node, values_node),
-        )
-
-        input_node.meta["val"] = torch.empty(4, 4, dtype=torch.bfloat16, device="meta")
-        index_node.meta["val"] = torch.empty(2, 4, dtype=torch.int64, device="meta")
-        values_node.meta["val"] = torch.empty(
-            100, 4, dtype=torch.bfloat16, device="meta"
-        )
-
-        candidate = _evaluate_candidate(
-            output_node, force=False, ctx=ScatterPassContext()
-        )
-        self.assertIsNotNone(candidate)
-        self.assertEqual(candidate.values_numel, values_node.meta["val"].numel())
-
-    def test_compute_num_partitions_traffic_cap(self):
-        """P <= writes_per_slot caps each buffer phase at the scatter's own
-        traffic; min_p wins below that floor."""
-        available = 10**12  # effectively unlimited
-
-        # writes_per_slot=256 → cap=256, min(256, max_p=128) = 128
-        result = _compute_num_partitions(
-            available, 1024, 4, min_p=2, max_p=128, writes_per_slot=256
-        )
-        self.assertEqual(result, 128)
-
-        # writes_per_slot=64 → cap=64
-        result = _compute_num_partitions(
-            available, 1024, 4, min_p=2, max_p=128, writes_per_slot=64
-        )
-        self.assertEqual(result, 64)
-
-        # writes_per_slot=4 → cap=4
-        result = _compute_num_partitions(
-            available, 1024, 4, min_p=2, max_p=128, writes_per_slot=4
-        )
-        self.assertEqual(result, 4)
-
-        # writes_per_slot=0.5 → cap=max(2, 1)=2
-        result = _compute_num_partitions(
-            available, 1024, 4, min_p=2, max_p=128, writes_per_slot=0.5
-        )
-        self.assertEqual(result, 2)
-
-        # scatter index [1024, 1] into [16, 64] writes 1024 elements, not a full row.
-        result = _compute_num_partitions(
-            available, 16 * 64, 4, min_p=2, max_p=128, writes_per_slot=1024 / (16 * 64)
-        )
-        self.assertEqual(result, 2)
-
     def test_skip_low_contention_ratio_multidim(self):
         """
         Contention gate uses index_size / scatter_dim_size, not index_size / output_numel.
@@ -1505,6 +1328,187 @@ class TestPartitionedScatterOpt(TestCase):
         )
 
         config.partitioned_scatter_enabled = True
+
+
+class TestPartitionedScatterOptGeneric(TestCase):
+    """Pure-graph/config unit tests for the partitioned scatter pass."""
+
+    def test_index_add_alpha_not_matched(self):
+        """alpha scales the source, which the rewrite does not carry, so an
+        aten.index_add holding one must not be picked up. Asserted on the scan:
+        where the decomposition fires instead, alpha is folded into the source
+        and the index_put left behind is matched legitimately."""
+        N, n, D = 8192, 8, 4
+
+        graph = torch.fx.Graph()
+        out_node = graph.placeholder("out")
+        idx_node = graph.placeholder("idx")
+        vals_node = graph.placeholder("vals")
+        plain = graph.call_function(
+            torch.ops.aten.index_add.default, (out_node, 0, idx_node, vals_node)
+        )
+        scaled = graph.call_function(
+            torch.ops.aten.index_add.default,
+            (out_node, 0, idx_node, vals_node),
+            {"alpha": 2},
+        )
+
+        out_node.meta["val"] = torch.empty(n, D, dtype=torch.bfloat16, device="meta")
+        idx_node.meta["val"] = torch.empty(N, dtype=torch.int64, device="meta")
+        vals_node.meta["val"] = torch.empty(N, D, dtype=torch.bfloat16, device="meta")
+
+        ctx = ScatterPassContext()
+        _scan_candidates(graph, ctx)
+        self.assertIn(plain, ctx.candidates)
+        self.assertNotIn(scaled, ctx.candidates)
+
+    def test_atomic_fallback_checks_accumulation_dtype(self):
+        """Where bf16 atomics fall back (sm<90, XPU) aten.index_add is only ever
+        bf16, so the gate must look at the dtype the rewrite emits: fp32 partials
+        are native atomics, bf16 partials would fall back onto a P-times buffer."""
+        N, n, D = 8192, 8, 4
+
+        graph = torch.fx.Graph()
+        out_node = graph.placeholder("out")
+        idx_node = graph.placeholder("idx")
+        vals_node = graph.placeholder("vals")
+        index_add = graph.call_function(
+            torch.ops.aten.index_add.default, (out_node, 0, idx_node, vals_node)
+        )
+        out_node.meta["val"] = torch.empty(n, D, dtype=torch.bfloat16, device="meta")
+        idx_node.meta["val"] = torch.empty(N, dtype=torch.int64, device="meta")
+        vals_node.meta["val"] = torch.empty(N, D, dtype=torch.bfloat16, device="meta")
+
+        def bf16_atomics_fall_back(dtype):
+            return dtype in (torch.bfloat16, torch.int64, torch.bool)
+
+        with mock.patch(
+            "torch._inductor.utils.needs_fallback_due_to_atomic_add_limitations",
+            bf16_atomics_fall_back,
+        ):
+            for fp32_acc in (True, False):
+                ctx = ScatterPassContext()
+                with config.patch(partitioned_scatter_fp32_accumulation=fp32_acc):
+                    candidate = _evaluate_candidate(index_add, True, ctx)
+                if fp32_acc:
+                    self.assertIsNotNone(candidate)
+                    self.assertEqual(candidate.acc_dtype, torch.float32)
+                else:
+                    self.assertIsNone(candidate)
+                    self.assertEqual(ctx.skip_reasons["atomic_fallback"], 1)
+
+    def test_accumulation_dtype_follows_config(self):
+        """Only float dtypes narrower than fp32 are promoted, and only when the
+        config flag is set."""
+        narrow = (torch.bfloat16, torch.float16)
+        unchanged = (torch.float32, torch.float64, torch.int32, torch.int64)
+
+        with config.patch(partitioned_scatter_fp32_accumulation=True):
+            for dtype in narrow:
+                self.assertEqual(_accumulation_dtype(dtype), torch.float32, str(dtype))
+            for dtype in unchanged:
+                self.assertEqual(_accumulation_dtype(dtype), dtype, str(dtype))
+
+        with config.patch(partitioned_scatter_fp32_accumulation=False):
+            for dtype in narrow + unchanged:
+                self.assertEqual(_accumulation_dtype(dtype), dtype, str(dtype))
+
+    def test_compute_num_partitions_tight_budget(self):
+        """Memory constraint picks P=4: P=8 overhead (28 MB) exceeds 20 MB budget."""
+        # P=4: overhead = 1M * 4 * 3 = 12 MB ≤ 20 MB
+        # P=8: overhead = 1M * 4 * 7 = 28 MB > 20 MB
+        result = _compute_num_partitions(20_000_000, 1_000_000, 4, min_p=2, max_p=128)
+        self.assertEqual(result, 4)
+
+    def test_widen_bytes_charged_outside_expanded_buffer(self):
+        """fp32 partials also cost a widened copy of the values and the width the
+        peak's own output copy cannot credit. Neither scales with num_partitions."""
+        node = torch.fx.Graph().placeholder("x")
+
+        def candidate(dtype, acc_dtype):
+            return ScatterCandidate(
+                output_node=node,
+                index_node=node,
+                scatter_dim=0,
+                output_size=1_000_000,
+                index_size=4_000_000,
+                scatter_dim_size=1_000_000,
+                values_numel=4_000_000,
+                contention_ratio=4.0,
+                writes_per_slot=4.0,
+                dtype=dtype,
+                acc_dtype=acc_dtype,
+            )
+
+        same = candidate(torch.float32, torch.float32)
+        wider = candidate(torch.bfloat16, torch.float32)
+
+        self.assertEqual(_widen_bytes(same), 0)
+        # 4M values at fp32, plus the 2 bytes/element a bf16 output cannot cover.
+        self.assertEqual(_widen_bytes(wider), 18_000_000)
+
+    @config.patch(
+        partitioned_scatter_min_index_size=1,
+        partitioned_scatter_min_contention_ratio=0.0,
+    )
+    def test_scatter_widening_uses_full_source_size(self):
+        """scatter permits src to be larger than index, and the rewrite widens
+        all of it, so the charge cannot be derived from the index."""
+        graph = torch.fx.Graph()
+        input_node = graph.placeholder("input")
+        index_node = graph.placeholder("index")
+        values_node = graph.placeholder("values")
+        output_node = graph.call_function(
+            torch.ops.aten.scatter_add.default,
+            (input_node, 0, index_node, values_node),
+        )
+
+        input_node.meta["val"] = torch.empty(4, 4, dtype=torch.bfloat16, device="meta")
+        index_node.meta["val"] = torch.empty(2, 4, dtype=torch.int64, device="meta")
+        values_node.meta["val"] = torch.empty(
+            100, 4, dtype=torch.bfloat16, device="meta"
+        )
+
+        candidate = _evaluate_candidate(
+            output_node, force=False, ctx=ScatterPassContext()
+        )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.values_numel, values_node.meta["val"].numel())
+
+    def test_compute_num_partitions_traffic_cap(self):
+        """P <= writes_per_slot caps each buffer phase at the scatter's own
+        traffic; min_p wins below that floor."""
+        available = 10**12  # effectively unlimited
+
+        # writes_per_slot=256 → cap=256, min(256, max_p=128) = 128
+        result = _compute_num_partitions(
+            available, 1024, 4, min_p=2, max_p=128, writes_per_slot=256
+        )
+        self.assertEqual(result, 128)
+
+        # writes_per_slot=64 → cap=64
+        result = _compute_num_partitions(
+            available, 1024, 4, min_p=2, max_p=128, writes_per_slot=64
+        )
+        self.assertEqual(result, 64)
+
+        # writes_per_slot=4 → cap=4
+        result = _compute_num_partitions(
+            available, 1024, 4, min_p=2, max_p=128, writes_per_slot=4
+        )
+        self.assertEqual(result, 4)
+
+        # writes_per_slot=0.5 → cap=max(2, 1)=2
+        result = _compute_num_partitions(
+            available, 1024, 4, min_p=2, max_p=128, writes_per_slot=0.5
+        )
+        self.assertEqual(result, 2)
+
+        # scatter index [1024, 1] into [16, 64] writes 1024 elements, not a full row.
+        result = _compute_num_partitions(
+            available, 16 * 64, 4, min_p=2, max_p=128, writes_per_slot=1024 / (16 * 64)
+        )
+        self.assertEqual(result, 2)
 
 
 if HAS_GPU:
