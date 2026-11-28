@@ -1007,33 +1007,6 @@ class TestPartitionedScatterOpt(TestCase):
                 f"force mode output mismatch: expected={e[:5]} actual={a[:5]}",
             )
 
-    def test_skip_cpu_device(self):
-        """CPU scatters are never rewritten, even with force enabled."""
-        torch.manual_seed(21)
-        N, n = 8192, 8
-
-        def f(out, idx, vals):
-            return out.index_put([idx], vals, accumulate=True)
-
-        out = torch.zeros(n, dtype=torch.float32, device="cpu")
-        idx = torch.randint(0, 4, (N,), dtype=torch.int64, device="cpu")
-        vals = torch.randn(N, dtype=torch.float32, device="cpu")
-
-        config.partitioned_scatter_force = True
-        with torch.no_grad():
-            expected = f(out, idx, vals)
-            actual = torch.compile(f, backend="inductor", fullgraph=True)(
-                out, idx, vals
-            )
-
-        self.assertEqual(counters["inductor"]["partitioned_scatter_applied"], 0)
-        self.assertGreater(
-            counters["inductor"]["partitioned_scatter_skipped_cpu_device"],
-            0,
-            "CPU scatter should be skipped by the device gate",
-        )
-        self.assertTrue(torch.allclose(expected, actual, atol=1e-1, rtol=1e-2))
-
     def test_skip_atomic_fallback(self):
         torch.manual_seed(21)
         N, n, D = 8192, 8, 4
@@ -1509,6 +1482,51 @@ class TestPartitionedScatterOptGeneric(TestCase):
             available, 16 * 64, 4, min_p=2, max_p=128, writes_per_slot=1024 / (16 * 64)
         )
         self.assertEqual(result, 2)
+
+
+class TestPartitionedScatterOptOnlyCPU(TestCase):
+    """The CPU device gate: CPU scatters are never rewritten."""
+
+    def setUp(self):
+        super().setUp()
+        metrics.reset()
+        counters.clear()
+        torch._dynamo.reset()
+        self._saved_enabled = config.partitioned_scatter_enabled
+        self._saved_force = config.partitioned_scatter_force
+        config.partitioned_scatter_enabled = True
+
+    def tearDown(self):
+        config.partitioned_scatter_enabled = self._saved_enabled
+        config.partitioned_scatter_force = self._saved_force
+        super().tearDown()
+
+    def test_skip_cpu_device(self):
+        """CPU scatters are never rewritten, even with force enabled."""
+        torch.manual_seed(21)
+        N, n = 8192, 8
+
+        def f(out, idx, vals):
+            return out.index_put([idx], vals, accumulate=True)
+
+        out = torch.zeros(n, dtype=torch.float32, device="cpu")
+        idx = torch.randint(0, 4, (N,), dtype=torch.int64, device="cpu")
+        vals = torch.randn(N, dtype=torch.float32, device="cpu")
+
+        config.partitioned_scatter_force = True
+        with torch.no_grad():
+            expected = f(out, idx, vals)
+            actual = torch.compile(f, backend="inductor", fullgraph=True)(
+                out, idx, vals
+            )
+
+        self.assertEqual(counters["inductor"]["partitioned_scatter_applied"], 0)
+        self.assertGreater(
+            counters["inductor"]["partitioned_scatter_skipped_cpu_device"],
+            0,
+            "CPU scatter should be skipped by the device gate",
+        )
+        self.assertTrue(torch.allclose(expected, actual, atol=1e-1, rtol=1e-2))
 
 
 if HAS_GPU:
