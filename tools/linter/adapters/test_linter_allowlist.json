@@ -433,7 +433,6 @@
   "test/inductor/test_profiler_trace.py",
   "test/inductor/test_provenance_tracing.py",
   "test/inductor/test_reorder_for_locality_in_training.py",
-  "test/inductor/test_scatter_optimization.py",
   "test/inductor/test_select_algorithm.py",
   "test/inductor/test_slice_scatter_chunking.py",
   "test/inductor/test_split_cat_fx_aten_passes.py",
